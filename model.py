@@ -58,6 +58,11 @@ class WTS(nn.Module):
         self.gru = gru(3, hidden_size)
         self.out_mlp = mlp(hidden_size * 4, hidden_size, 3)
 
+        self.loudness_mlp = nn.Sequential(
+            nn.Linear(1, 1),
+            nn.Sigmoid()
+        )
+
         self.proj_matrices = nn.ModuleList([
             nn.Linear(hidden_size, n_harmonic + 1),
             nn.Linear(hidden_size, n_bands),
@@ -91,9 +96,9 @@ class WTS(nn.Module):
         hidden = self.out_mlp(hidden)
 
         # harmonic part
-        print(hidden.shape, 'hidden')
-        param = scale_function(self.proj_matrices[0](hidden))
-        print(param.shape, 'param')
+        param = self.proj_matrices[0](hidden)
+        if self.mode != "wavetable":
+            param = scale_function(self.proj_matrices[0](hidden))
 
         total_amp = param[..., :1]
         amplitudes = param[..., 1:]
@@ -106,14 +111,18 @@ class WTS(nn.Module):
         amplitudes /= amplitudes.sum(-1, keepdim=True)
         amplitudes *= total_amp
 
+        total_amp_2 = self.loudness_mlp(loudness)
+
         amplitudes = upsample(amplitudes, self.block_size)
         pitch = upsample(pitch, self.block_size)
+        total_amp = upsample(total_amp, self.block_size)    # this one can't use, found problems when back propagated, weird
+        total_amp_2 = upsample(total_amp_2, self.block_size)    # use this instead for wavetable
 
         # replace with wavetable synthesis
         if self.mode == "wavetable":
             print(self.mode)
-            harmonic = self.wts(pitch, amplitudes, self.duration_secs)
-            harmonic = harmonic.unsqueeze(0).unsqueeze(-1)  # TODO: this should be remove too
+            harmonic = self.wts(pitch, total_amp_2, self.duration_secs)
+            # harmonic = harmonic.unsqueeze(0).unsqueeze(-1)  # TODO: this should be remove too
         else:
             print(self.mode)
             harmonic = harmonic_synth(pitch, amplitudes, self.sampling_rate)

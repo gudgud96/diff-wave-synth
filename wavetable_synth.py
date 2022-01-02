@@ -39,20 +39,13 @@ def wavetable_osc_fast(wavetable, freq, sr):
     index = torch.cumsum(increment, dim=0) - increment[0]
     index = index % wavetable.shape[0]
 
-    # TODO: obviously this is not differentiable. need to find another work around.
-    # look into F.grid_sample
+    # linear interpolate
     index_low = torch.floor(index.clone())
     index_high = torch.ceil(index.clone())
     alpha = index - index_low
-
-    # index_low = torch.where(index_low == index_high, index_low - 1, index_low)
-
     index_low = index_low.long()
     index_high = index_high.long()
 
-    # linear interpolate
-    # output = (index - index_low) * wavetable[index_high % wavetable.shape[0]] + \
-    #          (index_high - index) * wavetable[index_low]
     output = wavetable[index_low] + alpha * (wavetable[index_high % wavetable.shape[0]] - wavetable[index_low])
         
     return output
@@ -63,13 +56,18 @@ class WavetableSynth(nn.Module):
                  wavetables=None,
                  n_wavetables=64,
                  wavetable_len=512,
-                 sr=44100):
+                 sr=44100,
+                 duration_secs=3):
         super(WavetableSynth, self).__init__()
         if wavetables is None: 
             # TODO: parameterize this
-            self.wavetables = torch.nn.Parameter(torch.normal(mean=torch.zeros(n_wavetables, wavetable_len),
-                                                              std=torch.ones(n_wavetables, wavetable_len) * 0.01))
+            self.wavetables = torch.nn.Parameter(torch.normal(mean=torch.zeros(n_wavetables, wavetable_len + 1),
+                                                              std=torch.ones(n_wavetables, wavetable_len + 1) * 0.001))
+            self.wavetables.data = torch.cat([self.wavetables[:, :-1], self.wavetables[:, 0].unsqueeze(-1)], dim=-1)
             self.wavetables.requires_grad = True
+
+            self.attention = torch.nn.Parameter(torch.normal(mean=torch.zeros(n_wavetables, sr * duration_secs),
+                                                             std=torch.ones(n_wavetables, sr * duration_secs) * 1))
         else:
             self.wavetables = wavetables
         self.sr = sr
@@ -79,16 +77,28 @@ class WavetableSynth(nn.Module):
             pitch: (t * sr,)       # frequency
             amplitude: (t * sr,)
         """
-        # TODO: extend to batch
-        output_waveform = torch.zeros(duration_secs * self.sr,) 
-        for wt in self.wavetables:
-            waveform = wavetable_osc_fast(wt, pitch, self.sr)
+        self.wavetables.data = torch.cat([self.wavetables[:, :-1], self.wavetables[:, 0].unsqueeze(-1)], dim=-1)
+        assert (self.wavetables[:, 0] == self.wavetables[:, -1]).all()
 
-            # TODO: change to parameterizable attention later. now just do average poolling
-            waveform *= torch.ones(waveform.shape) / self.wavetables.shape[0]
-            output_waveform += waveform.squeeze()
+        attention = nn.Softmax(dim=0)(self.attention)
+
+        output_waveform = torch.zeros(duration_secs * self.sr,) 
+        waveform_lst = []
         
-        print(amplitude.shape, waveform.shape)
+        for wt_idx in range(self.wavetables.shape[0]):
+            wt = self.wavetables[wt_idx]
+            waveform = wavetable_osc_fast(wt, pitch, self.sr)
+            waveform_lst.append(waveform.squeeze())
+        
+        # attention per wavetable
+        output_waveform = torch.stack(waveform_lst, dim=0)
+        output_waveform = output_waveform * attention
+        
+        # sum into final output
+        output_waveform = torch.sum(output_waveform, dim=0)
+        output_waveform = output_waveform.unsqueeze(0).unsqueeze(-1)
+        output_waveform = output_waveform * amplitude
+        
         return output_waveform
 
 

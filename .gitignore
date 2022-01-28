@@ -1,0 +1,11 @@
+*.wav
+*.png
+Lib/
+Scripts/
+__pycache__/
+logs/
+pyvenv.cfg
+share/
+test.gv
+test.gv.pdf
+*.pt

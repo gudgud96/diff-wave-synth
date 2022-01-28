@@ -4,7 +4,11 @@ import torch.fft as fft
 import numpy as np
 import librosa as li
 import crepe
+from torchcrepeV2 import TorchCrepePredictor
 import math
+
+
+crepe_predictor = TorchCrepePredictor()
 
 
 def safe_log(x):
@@ -123,11 +127,12 @@ def extract_loudness(audio, sampling_rate, block_size=None, n_fft=2048, frame_ra
 
     # Remove temporary batch dimension.
     loudness = loudness[0] if is_1d else loudness
+    loudness = loudness.numpy()
 
     return loudness
 
 
-def extract_pitch(signal, sampling_rate, block_size):
+def extract_pitch(signal, sampling_rate, block_size, model_capacity="full"):
     length = signal.shape[-1] // block_size
     f0 = crepe.predict(
         signal,
@@ -136,9 +141,30 @@ def extract_pitch(signal, sampling_rate, block_size):
         verbose=1,
         center=True,
         viterbi=True,
+        model_capacity="full"
     )
     f0 = f0[1].reshape(-1)[:-1]
 
+    if f0.shape[-1] != length:
+        f0 = np.interp(
+            np.linspace(0, 1, length, endpoint=False),
+            np.linspace(0, 1, f0.shape[-1], endpoint=False),
+            f0,
+        )
+
+    return f0
+
+
+def extract_pitch_v2(signal, sampling_rate, block_size, model_capacity="full"):
+    length = signal.shape[-1] // block_size
+    f0 = crepe_predictor.predict(
+        signal,
+        sampling_rate,
+        step_size=int(1000 * block_size / sampling_rate),
+        verbose=1,
+        center=True,
+        viterbi=True
+    )
     if f0.shape[-1] != length:
         f0 = np.interp(
             np.linspace(0, 1, length, endpoint=False),
@@ -198,3 +224,15 @@ def fft_convolve(signal, kernel):
     output = output[..., output.shape[-1] // 2:]
 
     return output
+
+
+def get_scheduler(len_dataset, start_lr, stop_lr, length):
+    def schedule(epoch):
+        step = epoch * len_dataset
+        if step < length:
+            t = step / length
+            return start_lr * (1 - t) + stop_lr * t
+        else:
+            return stop_lr
+
+    return schedule

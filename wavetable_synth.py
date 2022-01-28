@@ -36,7 +36,7 @@ def wavetable_osc(wavetable, freq, sr, interpolator, duration_secs):
 def wavetable_osc_fast(wavetable, freq, sr):
     freq = freq.squeeze()
     increment = freq / sr * wavetable.shape[0]
-    index = torch.cumsum(increment, dim=0) - increment[0]
+    index = torch.cumsum(increment, dim=1) - increment[0]
     index = index % wavetable.shape[0]
 
     # linear interpolate
@@ -60,67 +60,93 @@ class WavetableSynth(nn.Module):
                  duration_secs=3):
         super(WavetableSynth, self).__init__()
         if wavetables is None: 
-            # TODO: parameterize this
-            self.wavetables = torch.nn.Parameter(torch.normal(mean=torch.zeros(n_wavetables, wavetable_len + 1),
-                                                              std=torch.ones(n_wavetables, wavetable_len + 1) * 0.001))
-            self.wavetables.data = torch.cat([self.wavetables[:, :-1], self.wavetables[:, 0].unsqueeze(-1)], dim=-1)
-            self.wavetables.requires_grad = True
+            self.wavetables = nn.ParameterList([nn.Parameter(torch.normal(mean=torch.zeros(wavetable_len),
+                                                                          std=torch.ones(wavetable_len) * 0.01)) for _ in range(n_wavetables)])
 
-            self.attention = torch.nn.Parameter(torch.normal(mean=torch.zeros(n_wavetables, sr * duration_secs),
-                                                             std=torch.ones(n_wavetables, sr * duration_secs) * 1))
+            for wt in self.wavetables:
+                wt.data = torch.cat([wt[:-1], wt[0].unsqueeze(-1)], dim=-1)
+                wt.requires_grad = True
+            
+            # self.wavetables = torch.nn.Parameter(torch.normal(mean=torch.zeros(n_wavetables, wavetable_len + 1),
+            #                                                   std=torch.ones(n_wavetables, wavetable_len + 1) * 0.01))
+            # self.wavetables.data = torch.cat([self.wavetables[:, :-1], self.wavetables[:, 0].unsqueeze(-1)], dim=-1)
+            # self.wavetables.requires_grad = True
+
+            # self.attention = None
+            # self.attention = nn.Parameter(torch.zeros(n_wavetables, 100 * duration_secs))
+            # torch.nn.init.xavier_uniform(self.attention)
+
         else:
             self.wavetables = wavetables
+            self.attention = nn.Parameter(torch.normal(mean=torch.zeros(n_wavetables, sr * duration_secs),
+                                                       std=torch.ones(n_wavetables, sr * duration_secs) * 1))
         self.sr = sr
+        self.attention_mlp = nn.Conv1d(1, 1, 5, stride=1, padding=2)
+        self.attention_softmax = nn.Softmax(dim=0)
 
-    def forward(self, pitch, amplitude, duration_secs):
+    def forward(self, pitch, amplitude, y, duration_secs):
         """
             pitch: (t * sr,)       # frequency
             amplitude: (t * sr,)
         """
-        self.wavetables.data = torch.cat([self.wavetables[:, :-1], self.wavetables[:, 0].unsqueeze(-1)], dim=-1)
-        assert (self.wavetables[:, 0] == self.wavetables[:, -1]).all()
-
-        attention = nn.Softmax(dim=0)(self.attention)
-
-        output_waveform = torch.zeros(duration_secs * self.sr,) 
-        waveform_lst = []
+        y = y.cuda()
         
-        for wt_idx in range(self.wavetables.shape[0]):
+        # output_waveform = torch.zeros(pitch.shape[0], pitch.shape[1]).cuda()
+        output_waveform = []
+        attention = []
+        for wt_idx in range(len(self.wavetables)):
             wt = self.wavetables[wt_idx]
             waveform = wavetable_osc_fast(wt, pitch, self.sr)
-            waveform_lst.append(waveform.squeeze())
-        
-        # attention per wavetable
-        output_waveform = torch.stack(waveform_lst, dim=0)
+
+            cur_att = waveform * y
+            cur_att = torch.mean(cur_att, dim=0)
+            attention.append(cur_att)
+            output_waveform.append(waveform)
+
+        attention = torch.stack(attention, dim=0).unsqueeze(1)
+        attention = self.attention_mlp(attention).squeeze()
+        attention = self.attention_softmax(attention)
+
+        self.attention = attention
+
+        output_waveform = torch.stack(output_waveform, dim=1)
         output_waveform = output_waveform * attention
-        
-        # sum into final output
-        output_waveform = torch.sum(output_waveform, dim=0)
-        output_waveform = output_waveform.unsqueeze(0).unsqueeze(-1)
+        output_waveform = torch.sum(output_waveform, dim=1)
+      
+        output_waveform = output_waveform.unsqueeze(-1)
         output_waveform = output_waveform * amplitude
-        
+       
         return output_waveform
 
 
 if __name__ == "__main__":
     # create a sine wavetable
     wavetable_len = 512
-    sr = 44100
-    duration = 3
-    freq = 739.99
+    sr = 16000
+    duration = 4
+    freq_t = [739.99 for _ in range(sr)] + [523.25 for _ in range(sr)] + [349.23 for _ in range(sr * 2)]
+    freq_t = torch.tensor(freq_t)
+    freq_t = torch.stack([freq_t, freq_t, freq_t], dim=0)
     sine_wavetable = generate_wavetable(wavetable_len, np.sin)
     # sawtooth_wavetable = generate_wavetable(wavetable_len, sawtooth_waveform)
     wavetable = torch.tensor([sine_wavetable,])
     
-    wt_synth = WavetableSynth(wavetables=wavetable, sr=sr)
-    freq_t = torch.ones(sr * duration,) * freq
+    wt_synth = WavetableSynth(wavetables=wavetable, sr=sr, duration_secs=4)
+    # freq_t = torch.ones(sr * duration,) * freq
     amplitude_t = torch.ones(sr * duration,)
+    amplitude_t = torch.stack([amplitude_t, amplitude_t, amplitude_t], dim=0)
+    amplitude_t = amplitude_t.unsqueeze(-1)
 
-    print(freq_t, 'freq')
+    # print(freq_t, 'freq')
     y = wt_synth(freq_t, amplitude_t, duration)
-    # sf.write('test_3s.wav', y, sr, 'PCM_24')
-    plt.plot(y[1000:2000])
+    print(y.shape, 'y')
+    plt.plot(y.squeeze()[0].detach().numpy())
     plt.show()
+    sf.write('test_3s_v1.wav', y.squeeze()[0].detach().numpy(), sr, 'PCM_24')
+    sf.write('test_3s_v2.wav', y.squeeze()[1].detach().numpy(), sr, 'PCM_24')
+    sf.write('test_3s_v3.wav', y.squeeze()[2].detach().numpy(), sr, 'PCM_24')
+    # plt.plot(y[1000:2000])
+    # plt.show()
 
 
 

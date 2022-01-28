@@ -47,9 +47,9 @@ class WTS(nn.Module):
         self.register_buffer("sampling_rate", torch.tensor(sampling_rate))
         self.register_buffer("block_size", torch.tensor(block_size))
 
-        self.encoder = mlp(20, hidden_size, 3)
-        self.layer_norm = nn.LayerNorm(20)
-        self.gru_mfcc = nn.GRU(20, 512, batch_first=True)
+        self.encoder = mlp(30, hidden_size, 3)
+        self.layer_norm = nn.LayerNorm(30)
+        self.gru_mfcc = nn.GRU(30, 512, batch_first=True)
         self.mlp_mfcc = nn.Linear(512, 16)
 
         self.in_mlps = nn.ModuleList([mlp(1, hidden_size, 3),
@@ -69,7 +69,7 @@ class WTS(nn.Module):
         ])
 
         self.reverb = Reverb(sampling_rate, sampling_rate)
-        self.wts = WavetableSynth(n_wavetables=n_wavetables, sr=sampling_rate)
+        self.wts = WavetableSynth(n_wavetables=n_wavetables, sr=sampling_rate, duration_secs=duration_secs)
 
         self.register_buffer("cache_gru", torch.zeros(1, 1, hidden_size))
         self.register_buffer("phase", torch.zeros(1))
@@ -77,7 +77,7 @@ class WTS(nn.Module):
         self.mode = mode
         self.duration_secs = duration_secs
 
-    def forward(self, mfcc, pitch, loudness):
+    def forward(self, y, mfcc, pitch, loudness):
         # encode mfcc first
         # use layer norm instead of trainable norm
         mfcc = self.layer_norm(torch.transpose(mfcc, 1, 2))
@@ -120,11 +120,8 @@ class WTS(nn.Module):
 
         # replace with wavetable synthesis
         if self.mode == "wavetable":
-            print(self.mode)
-            harmonic = self.wts(pitch, total_amp_2, self.duration_secs)
-            # harmonic = harmonic.unsqueeze(0).unsqueeze(-1)  # TODO: this should be remove too
+            harmonic = self.wts(pitch, total_amp_2, y, self.duration_secs)
         else:
-            print(self.mode)
             harmonic = harmonic_synth(pitch, amplitudes, self.sampling_rate)
 
         # noise part
@@ -143,7 +140,7 @@ class WTS(nn.Module):
         signal = harmonic + noise
 
         #reverb part
-        signal = self.reverb(signal)
+        # signal = self.reverb(signal)
 
         return signal
 

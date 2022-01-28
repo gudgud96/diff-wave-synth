@@ -1,0 +1,33 @@
+dataset:
+  train_path: "E:/nsynth/nsynth-train/"
+  valid_path: "E:/nsynth/nsynth-valid/"
+  test_path: "E:/nsynth/nsynth-test/"
+  train_subset_files: "keys_train.txt"
+  valid_subset_files: "keys_valid.txt"
+  test_subset_files: "keys_test.txt"
+  metadata: "examples.json"
+  audio: "audio/"
+  pitch: "pitch/"
+  loudness: "loudness/"
+
+common:
+  sampling_rate: 16000
+  block_size: 160
+  duration_secs: 4
+
+train:
+  batch_size: 16
+  scales: [4096, 2048, 1024, 512, 256, 128]
+  overlap: .75
+  start_lr: 1e-3
+  stop_lr: 1e-4
+  decay_over: 400000
+
+test:
+  batch_size: 2
+  scales: [4096, 2048, 1024, 512, 256, 128]
+  overlap: .75
+
+crepe:
+  model: "large"
+  

@@ -1,60 +1,56 @@
-import librosa
-import soundfile as sf
+from sre_constants import SRE_FLAG_DOTALL
 import numpy as np
-from core import extract_loudness, extract_pitch, multiscale_fft
-from model import WTS, DDSPv2
+from core import extract_loudness, extract_pitch_v2, multiscale_fft
 import torch
-import matplotlib.pyplot as plt
+import yaml 
+from dataloader import get_data_loader
+from tqdm import tqdm
+from model import WTS
 from nnAudio import Spectrogram
+from tensorboardX import SummaryWriter
+import soundfile as sf
+import matplotlib.pyplot as plt
+import librosa
 import librosa.display
 
-# filename = librosa.ex('trumpet')
-# y, sr = librosa.load("trumpet.mp3", duration=2.0)
-# print(y.shape)
+with open("config.yaml", 'r') as stream:
+    config = yaml.safe_load(stream)
 
-scales = [4096, 2048, 1024, 512, 256, 128]
-overlap = .75
-duration = 3
-model = WTS(hidden_size=512, n_harmonic=100, n_bands=65, sampling_rate=44100,
-            block_size=441, n_wavetables=3, mode="wavetable", duration_secs=duration)
-# model = DDSPv2(hidden_size=512, n_harmonic=100, n_bands=65, sampling_rate=44100,
-#                block_size=441)
-opt = torch.optim.Adam(model.parameters(), lr=1e-3)
-# spec = Spectrogram.MelSpectrogram(sr=44100)
-spec = Spectrogram.MFCC(sr=44100, n_mfcc=20)
+# general parameters
+sr = config["common"]["sampling_rate"]
+block_size = config["common"]["block_size"]
+duration_secs = config["common"]["duration_secs"]
+batch_size = config["train"]["batch_size"]
+scales = config["test"]["scales"]
+overlap = config["test"]["overlap"]
 
-# sf.write('test_trumpet_3s.wav', y, sr, 'PCM_24')
+model = WTS(hidden_size=512, n_harmonic=100, n_bands=65, sampling_rate=sr,
+            block_size=block_size, n_wavetables=10, mode="wavetable", 
+            duration_secs=duration_secs)
+model.cuda()
+model.load_state_dict(torch.load("model.pt"))
+spec = Spectrogram.MFCC(sr=sr, n_mfcc=30)
 
-def preprocess(f, sampling_rate, block_size, signal_length, oneshot, **kwargs):
-    x, sr = librosa.load(f, sampling_rate)
-    N = (signal_length - len(x) % signal_length) % signal_length
-    x = np.pad(x, (0, N))
+mean_loudness, std_loudness = -39.74668743704927, 54.19612404969509
 
-    if oneshot:
-        x = x[..., :signal_length]
+# test_dl = get_data_loader(config, mode="train", batch_size=batch_size)
 
-    pitch = extract_pitch(x, sampling_rate, block_size)
-    loudness = extract_loudness(x, sampling_rate, block_size)
+for y, loudness, pitch in tqdm(test_dl):
+    mfcc = spec(y)
+    pitch, loudness = pitch.unsqueeze(-1).float(), loudness.unsqueeze(-1).float()
+    loudness = (loudness - mean_loudness) / std_loudness
 
-    print(pitch.shape, loudness.shape, 'pl')
+    plt.plot(loudness[1].squeeze().numpy())
+    plt.show()
 
-    x = x.reshape(-1, signal_length)
-    pitch = pitch.reshape(x.shape[0], -1)
-    loudness = loudness.reshape(x.shape[0], -1)
+    mfcc = mfcc.cuda()
+    pitch = pitch.cuda()
+    loudness = loudness.cuda()
 
-    return x, pitch, loudness
-
-# x, pitch, loudness = preprocess('test_trumpet_3s.wav', 44100, 441, 44100 * duration, True)
-x, pitch, loudness = preprocess('test_flute.mp3', 44100, 441, 44100 * duration, True)
-mfcc = spec(torch.tensor(x))
-pitch, loudness = torch.tensor(pitch).unsqueeze(-1).float(), torch.tensor(loudness).unsqueeze(-1).float()
-mean_l, std_l = torch.mean(loudness), torch.std(loudness)
-
-for ep in range(200):
-    l = (loudness - mean_l) / std_l
-    output = model(mfcc, pitch, l)
+    output = model(mfcc, pitch, loudness)
+    
     ori_stft = multiscale_fft(
-                torch.tensor(x).squeeze(),
+                y.squeeze(),
                 scales,
                 overlap,
             )
@@ -68,46 +64,40 @@ for ep in range(200):
     cum_lin_loss = 0
     cum_log_loss = 0
     for s_x, s_y in zip(ori_stft, rec_stft):
-        lin_loss = (s_x - s_y).abs().mean()
+        s_x = s_x.cuda()
+        s_y = s_y.cuda()
+        
+        lin_loss = ((s_x - s_y).abs()).mean()
+        # lin_loss = torch.sum(lin_loss, dim=(1, 2)).mean()
+        print(lin_loss, 'lin_loss')
         log_loss = (torch.log(s_x + 1e-7) - torch.log(s_y + 1e-7)).abs().mean()
         loss += lin_loss
 
         cum_lin_loss += lin_loss
         cum_log_loss += log_loss
 
-    opt.zero_grad()
-    loss.backward()
-    opt.step()
+    print("Loss: {:.4}".format(loss.item()))
+    print(output.shape, y.shape)
+    break
 
-    print("Loss {}: {:.4} recon: {:.4} {:.4}".format(ep, loss.item(), cum_lin_loss.item(), cum_log_loss.item()))
 
-input_wav = x.squeeze()
-output_wav = output.squeeze().detach().numpy()
-
-D = librosa.amplitude_to_db(np.abs(librosa.stft(input_wav)), ref=np.max)
-librosa.display.specshow(D, y_axis='log', sr=44100, hop_length=1024,
-                         x_axis='time')
+fig, axs = plt.subplots(2)
+axs[0].plot(output.squeeze().cpu().detach().numpy()[1])
+axs[1].plot(y.squeeze().cpu().detach().numpy()[1])
 plt.show()
 
-D = librosa.amplitude_to_db(np.abs(librosa.stft(output_wav)), ref=np.max)
-librosa.display.specshow(D, y_axis='log', sr=44100, hop_length=1024,
-                         x_axis='time')
-plt.show()
-for i in range(len(model.wts.wavetables)):
-    plt.plot(model.wts.wavetables[i].squeeze().detach().numpy())
-    plt.title("Wavetable " + str(i))
+
+for idx in range(16):
+    D = librosa.amplitude_to_db(np.abs(librosa.stft(y.squeeze().cpu().detach().numpy()[idx])), ref=np.max)
+    librosa.display.specshow(D, y_axis='log', sr=sr, hop_length=512,
+                            x_axis='time')
     plt.show()
 
-att = torch.nn.Softmax(dim=0)(model.wts.attention)
-for i in range(len(att)):
-    plt.plot(att[i].squeeze().detach().numpy()[::400])
-    plt.title("Attention " + str(i))
+    D = librosa.amplitude_to_db(np.abs(librosa.stft(output.squeeze().cpu().detach().numpy()[idx])), ref=np.max)
+    librosa.display.specshow(D, y_axis='log', sr=sr, hop_length=512,
+                            x_axis='time')
     plt.show()
 
-sf.write('test_trumpet_out_v2.wav', output_wav, 44100, 'PCM_24')
-sf.write('test_trumpet_in_v2.wav', input_wav, 44100, 'PCM_24')
-
-
-
-
+    sf.write('test_model_out_v1_{}.wav'.format(idx), output.squeeze().cpu().detach().numpy()[idx], sr, 'PCM_24')
+    sf.write('test_model_in_v1_{}.wav'.format(idx), y.squeeze().cpu().detach().numpy()[idx], sr, 'PCM_24')
 

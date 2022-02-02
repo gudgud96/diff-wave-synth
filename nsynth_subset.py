@@ -1,3 +1,9 @@
+"""
+Filter out the subset used for neural audio synthesis projects by Magenta.
+Should still have slight difference with the actual dataset (as the numbers don't agree)
+Alternatively, you can directly download NSynth subset from TF dataset, instead of 
+downloading the whole dataset and filter with this script. 
+"""
 import json
 from tqdm import tqdm
 

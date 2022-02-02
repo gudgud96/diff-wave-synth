@@ -1,14 +1,19 @@
+"""
+Core functions. 
+The code mainly comes from https://github.com/acids-ircam/ddsp_pytorch with minor adaptations.
+"""
 import torch
 import torch.nn as nn
 import torch.fft as fft
 import numpy as np
 import librosa as li
 import crepe
-from torchcrepeV2 import TorchCrepePredictor
+# from torchcrepeV2 import TorchCrepePredictor
 import math
 
 
-crepe_predictor = TorchCrepePredictor()
+# torchcrepeV2 is my own version of crepe in torch, not released yet
+# crepe_predictor = TorchCrepePredictor()
 
 
 def safe_log(x):
@@ -155,24 +160,25 @@ def extract_pitch(signal, sampling_rate, block_size, model_capacity="full"):
     return f0
 
 
-def extract_pitch_v2(signal, sampling_rate, block_size, model_capacity="full"):
-    length = signal.shape[-1] // block_size
-    f0 = crepe_predictor.predict(
-        signal,
-        sampling_rate,
-        step_size=int(1000 * block_size / sampling_rate),
-        verbose=1,
-        center=True,
-        viterbi=True
-    )
-    if f0.shape[-1] != length:
-        f0 = np.interp(
-            np.linspace(0, 1, length, endpoint=False),
-            np.linspace(0, 1, f0.shape[-1], endpoint=False),
-            f0,
-        )
+# torchcrepeV2 is my own version of crepe in torch, not released yet
+# def extract_pitch_v2(signal, sampling_rate, block_size, model_capacity="full"):
+#     length = signal.shape[-1] // block_size
+#     f0 = crepe_predictor.predict(
+#         signal,
+#         sampling_rate,
+#         step_size=int(1000 * block_size / sampling_rate),
+#         verbose=1,
+#         center=True,
+#         viterbi=True
+#     )
+#     if f0.shape[-1] != length:
+#         f0 = np.interp(
+#             np.linspace(0, 1, length, endpoint=False),
+#             np.linspace(0, 1, f0.shape[-1], endpoint=False),
+#             f0,
+#         )
 
-    return f0
+#     return f0
 
 
 def mlp(in_size, hidden_size, n_layers):

@@ -1,3 +1,6 @@
+"""
+Differentiable wavetable synthesis component.
+"""
 import torch
 from torch import nn
 import numpy as np
@@ -6,40 +9,19 @@ from tqdm import tqdm
 import soundfile as sf
 import matplotlib.pyplot as plt
 from core import upsample
+import random
 
 
-def linear_interpolator(wavetable, index):
-    low = int(index)
-    high = int(np.ceil(index))
-
-    # Handle integer index
-    if low == high:
-        return wavetable[low]
-
-    # Return the weighted sum
-    return (index - low) * wavetable[high % wavetable.shape[0]] + \
-            (high - index) * wavetable[low]
-
-
-def wavetable_osc(wavetable, freq, sr, interpolator, duration_secs):
-    buffer = torch.zeros((duration_secs * sr,))
-    # TODO: remove for loop it's super slow
-    index = 0
-    for idx in tqdm(range(len(buffer))):
-        increment = wavetable.shape[0] * freq[idx] / sr
-        sample = interpolator(wavetable, index)
-        buffer[idx] = sample
-        index = (index + increment) % wavetable.shape[0]
-    return buffer
-
-
-def wavetable_osc_fast(wavetable, freq, sr):
+def wavetable_osc(wavetable, freq, sr):
+    """
+    General wavetable synthesis oscilator.
+    """
     freq = freq.squeeze()
     increment = freq / sr * wavetable.shape[0]
     index = torch.cumsum(increment, dim=1) - increment[0]
     index = index % wavetable.shape[0]
 
-    # linear interpolate
+    # uses linear interpolation implementation
     index_low = torch.floor(index.clone())
     index_high = torch.ceil(index.clone())
     alpha = index - index_low
@@ -51,76 +33,92 @@ def wavetable_osc_fast(wavetable, freq, sr):
     return output
 
 
+def generate_wavetable(length, f, cycle=1, phase=0):
+    """
+    Generate a wavetable of specified length using 
+    function f(x) where x is phase.
+    Period of f is assumed to be 2 pi.
+    """
+    wavetable = np.zeros((length,), dtype=np.float32)
+    for i in range(length):
+        wavetable[i] = f(cycle * 2 * np.pi * i / length + 2 * phase * np.pi)
+    return torch.tensor(wavetable)
+
+
 class WavetableSynth(nn.Module):
     def __init__(self,
                  wavetables=None,
                  n_wavetables=64,
                  wavetable_len=512,
                  sr=44100,
-                 duration_secs=3):
+                 duration_secs=3,
+                 block_size=160):
         super(WavetableSynth, self).__init__()
         if wavetables is None: 
-            self.wavetables = nn.ParameterList([nn.Parameter(torch.normal(mean=torch.zeros(wavetable_len),
-                                                                          std=torch.ones(wavetable_len) * 0.01)) for _ in range(n_wavetables)])
+            self.wavetables = []
+            for _ in range(n_wavetables):
+                cur = nn.Parameter(torch.empty(wavetable_len).normal_(mean=0, std=0.01))
+                self.wavetables.append(cur)
 
-            for wt in self.wavetables:
-                wt.data = torch.cat([wt[:-1], wt[0].unsqueeze(-1)], dim=-1)
-                wt.requires_grad = True
+            self.wavetables = nn.ParameterList(self.wavetables)
+
+            for idx, wt in enumerate(self.wavetables):
+                # following the paper, initialize f0-f3 wavetables and disable backprop
+                if idx == 0:
+                    wt.data = generate_wavetable(wavetable_len, np.sin, cycle=1, phase=random.uniform(0, 1))
+                    wt.data = torch.cat([wt[:-1], wt[0].unsqueeze(-1)], dim=-1)
+                    wt.requires_grad = False
+                elif idx == 1:
+                    wt.data = generate_wavetable(wavetable_len, np.sin, cycle=2, phase=random.uniform(0, 1))
+                    wt.data = torch.cat([wt[:-1], wt[0].unsqueeze(-1)], dim=-1)
+                    wt.requires_grad = False
+                elif idx == 2:
+                    wt.data = generate_wavetable(wavetable_len, np.sin, cycle=3, phase=random.uniform(0, 1))
+                    wt.data = torch.cat([wt[:-1], wt[0].unsqueeze(-1)], dim=-1)
+                    wt.requires_grad = False
+                elif idx == 3:
+                    wt.data = generate_wavetable(wavetable_len, np.sin, cycle=4, phase=random.uniform(0, 1))
+                    wt.data = torch.cat([wt[:-1], wt[0].unsqueeze(-1)], dim=-1)
+                    wt.requires_grad = False
+                else:
+                    wt.data = torch.cat([wt[:-1], wt[0].unsqueeze(-1)], dim=-1)
+                    wt.requires_grad = True
             
-            # self.wavetables = torch.nn.Parameter(torch.normal(mean=torch.zeros(n_wavetables, wavetable_len + 1),
-            #                                                   std=torch.ones(n_wavetables, wavetable_len + 1) * 0.01))
-            # self.wavetables.data = torch.cat([self.wavetables[:, :-1], self.wavetables[:, 0].unsqueeze(-1)], dim=-1)
-            # self.wavetables.requires_grad = True
-
-            # self.attention = None
-            # self.attention = nn.Parameter(torch.zeros(n_wavetables, 100 * duration_secs))
-            # torch.nn.init.xavier_uniform(self.attention)
+            self.attention = nn.Parameter(torch.randn(n_wavetables, 100 * duration_secs))
 
         else:
             self.wavetables = wavetables
-            self.attention = nn.Parameter(torch.normal(mean=torch.zeros(n_wavetables, sr * duration_secs),
-                                                       std=torch.ones(n_wavetables, sr * duration_secs) * 1))
+            self.attention = nn.Parameter(torch.randn(n_wavetables, 100 * duration_secs))
+        
         self.sr = sr
-        self.attention_mlp = nn.Conv1d(1, 1, 5, stride=1, padding=2)
+        self.block_size = block_size
         self.attention_softmax = nn.Softmax(dim=0)
 
-    def forward(self, pitch, amplitude, y, duration_secs):
-        """
-            pitch: (t * sr,)       # frequency
-            amplitude: (t * sr,)
-        """
-        y = y.cuda()
-        
-        # output_waveform = torch.zeros(pitch.shape[0], pitch.shape[1]).cuda()
-        output_waveform = []
-        attention = []
+    def forward(self, pitch, amplitude):        
+        output_waveform_lst = []
         for wt_idx in range(len(self.wavetables)):
             wt = self.wavetables[wt_idx]
-            waveform = wavetable_osc_fast(wt, pitch, self.sr)
+            if wt_idx not in [0, 1, 2, 3]:
+                wt = nn.Tanh()(wt)  # ensure wavetable range is between [-1, 1]
+            waveform = wavetable_osc(wt, pitch, self.sr)
+            output_waveform_lst.append(waveform)
 
-            cur_att = waveform * y
-            cur_att = torch.mean(cur_att, dim=0)
-            attention.append(cur_att)
-            output_waveform.append(waveform)
+        # apply attention 
+        attention = self.attention_softmax(self.attention)
+        attention_upsample = upsample(attention.unsqueeze(-1), self.block_size).squeeze()
 
-        attention = torch.stack(attention, dim=0).unsqueeze(1)
-        attention = self.attention_mlp(attention).squeeze()
-        attention = self.attention_softmax(attention)
-
-        self.attention = attention
-
-        output_waveform = torch.stack(output_waveform, dim=1)
-        output_waveform = output_waveform * attention
-        output_waveform = torch.sum(output_waveform, dim=1)
+        output_waveform = torch.stack(output_waveform_lst, dim=1)
+        output_waveform = output_waveform * attention_upsample
+        output_waveform_after = torch.sum(output_waveform, dim=1)
       
-        output_waveform = output_waveform.unsqueeze(-1)
-        output_waveform = output_waveform * amplitude
+        output_waveform_after = output_waveform_after.unsqueeze(-1)
+        output_waveform_after = output_waveform_after * amplitude
        
-        return output_waveform
+        return output_waveform_after
 
 
 if __name__ == "__main__":
-    # create a sine wavetable
+    # create a sine wavetable and to a simple synthesis test
     wavetable_len = 512
     sr = 16000
     duration = 4
@@ -128,16 +126,13 @@ if __name__ == "__main__":
     freq_t = torch.tensor(freq_t)
     freq_t = torch.stack([freq_t, freq_t, freq_t], dim=0)
     sine_wavetable = generate_wavetable(wavetable_len, np.sin)
-    # sawtooth_wavetable = generate_wavetable(wavetable_len, sawtooth_waveform)
     wavetable = torch.tensor([sine_wavetable,])
     
     wt_synth = WavetableSynth(wavetables=wavetable, sr=sr, duration_secs=4)
-    # freq_t = torch.ones(sr * duration,) * freq
     amplitude_t = torch.ones(sr * duration,)
     amplitude_t = torch.stack([amplitude_t, amplitude_t, amplitude_t], dim=0)
     amplitude_t = amplitude_t.unsqueeze(-1)
 
-    # print(freq_t, 'freq')
     y = wt_synth(freq_t, amplitude_t, duration)
     print(y.shape, 'y')
     plt.plot(y.squeeze()[0].detach().numpy())
@@ -145,8 +140,6 @@ if __name__ == "__main__":
     sf.write('test_3s_v1.wav', y.squeeze()[0].detach().numpy(), sr, 'PCM_24')
     sf.write('test_3s_v2.wav', y.squeeze()[1].detach().numpy(), sr, 'PCM_24')
     sf.write('test_3s_v3.wav', y.squeeze()[2].detach().numpy(), sr, 'PCM_24')
-    # plt.plot(y[1000:2000])
-    # plt.show()
 
 
 

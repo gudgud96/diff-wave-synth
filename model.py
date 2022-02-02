@@ -1,10 +1,12 @@
+"""
+Diff-WTS model. Main adapted from https://github.com/acids-ircam/ddsp_pytorch.
+"""
 from core import harmonic_synth
 from wavetable_synth import WavetableSynth
 import torch
 import torch.nn as nn
 from core import mlp, gru, scale_function, remove_above_nyquist, upsample
 from core import amp_to_impulse_response, fft_convolve
-from core import resample
 import math
 from torchvision.transforms import Resize
 
@@ -69,7 +71,10 @@ class WTS(nn.Module):
         ])
 
         self.reverb = Reverb(sampling_rate, sampling_rate)
-        self.wts = WavetableSynth(n_wavetables=n_wavetables, sr=sampling_rate, duration_secs=duration_secs)
+        self.wts = WavetableSynth(n_wavetables=n_wavetables, 
+                                  sr=sampling_rate, 
+                                  duration_secs=duration_secs,
+                                  block_size=block_size)
 
         self.register_buffer("cache_gru", torch.zeros(1, 1, hidden_size))
         self.register_buffer("phase", torch.zeros(1))
@@ -77,14 +82,14 @@ class WTS(nn.Module):
         self.mode = mode
         self.duration_secs = duration_secs
 
-    def forward(self, y, mfcc, pitch, loudness):
+    def forward(self, mfcc, pitch, loudness):
         # encode mfcc first
-        # use layer norm instead of trainable norm
+        # use layer norm instead of trainable norm, not much difference found
         mfcc = self.layer_norm(torch.transpose(mfcc, 1, 2))
         mfcc = self.gru_mfcc(mfcc)[0]
         mfcc = self.mlp_mfcc(mfcc)
 
-        # use image resize, ddsp also do this so...haha
+        # use image resize to align dimensions, ddsp also do this...
         mfcc = Resize(size=(self.duration_secs * 100, 16))(mfcc)
 
         hidden = torch.cat([
@@ -115,13 +120,14 @@ class WTS(nn.Module):
 
         amplitudes = upsample(amplitudes, self.block_size)
         pitch = upsample(pitch, self.block_size)
-        total_amp = upsample(total_amp, self.block_size)    # this one can't use, found problems when back propagated, weird
+        total_amp = upsample(total_amp, self.block_size)    # TODO: wts can't backprop when using this total_amp, not sure why
         total_amp_2 = upsample(total_amp_2, self.block_size)    # use this instead for wavetable
 
-        # replace with wavetable synthesis
         if self.mode == "wavetable":
-            harmonic = self.wts(pitch, total_amp_2, y, self.duration_secs)
+            # diff-wave-synth synthesizer
+            harmonic = self.wts(pitch, total_amp_2)
         else:
+            # ddsp synthesizer
             harmonic = harmonic_synth(pitch, amplitudes, self.sampling_rate)
 
         # noise part
@@ -139,96 +145,7 @@ class WTS(nn.Module):
 
         signal = harmonic + noise
 
-        #reverb part
+        # reverb part
         # signal = self.reverb(signal)
-
-        return signal
-
-
-class DDSPv2(nn.Module):
-    """
-    with encoder, input is mfcc
-    """
-    def __init__(self, hidden_size, n_harmonic, n_bands, sampling_rate,
-                 block_size):
-        super().__init__()
-        self.register_buffer("sampling_rate", torch.tensor(sampling_rate))
-        self.register_buffer("block_size", torch.tensor(block_size))
-
-        self.encoder = mlp(20, hidden_size, 3)
-        self.layer_norm = nn.LayerNorm(20)
-        self.gru_mfcc = nn.GRU(20, 512, batch_first=True)
-        self.mlp_mfcc = nn.Linear(512, 16)
-
-        self.in_mlps = nn.ModuleList([mlp(1, hidden_size, 3),
-                                      mlp(1, hidden_size, 3),
-                                      mlp(16, hidden_size, 3)])
-        self.gru = gru(3, hidden_size)
-        self.out_mlp = mlp(hidden_size * 4, hidden_size, 3)
-
-        self.proj_matrices = nn.ModuleList([
-            nn.Linear(hidden_size, n_harmonic + 1),
-            nn.Linear(hidden_size, n_bands),
-        ])
-
-        self.reverb = Reverb(sampling_rate, sampling_rate)
-
-        self.register_buffer("cache_gru", torch.zeros(1, 1, hidden_size))
-        self.register_buffer("phase", torch.zeros(1))
-
-    def forward(self, mfcc, pitch, loudness):
-        # encode mfcc first
-        # use layer norm instead of trainable norm
-        mfcc = self.layer_norm(torch.transpose(mfcc, 1, 2))
-        mfcc = self.gru_mfcc(mfcc)[0]
-        mfcc = self.mlp_mfcc(mfcc)
-
-        # use image resize, ddsp also do this so...haha
-        mfcc = Resize(size=(300, 16))(mfcc)
-
-        hidden = torch.cat([
-            self.in_mlps[0](pitch),
-            self.in_mlps[1](loudness),
-            self.in_mlps[2](mfcc)
-        ], -1)
-        hidden = torch.cat([self.gru(hidden)[0], hidden], -1)
-        hidden = self.out_mlp(hidden)
-
-        # harmonic part
-        param = scale_function(self.proj_matrices[0](hidden))
-
-        total_amp = param[..., :1]
-        amplitudes = param[..., 1:]
-
-        amplitudes = remove_above_nyquist(
-            amplitudes,
-            pitch,
-            self.sampling_rate,
-        )
-        amplitudes /= amplitudes.sum(-1, keepdim=True)
-        amplitudes *= total_amp
-
-        amplitudes = upsample(amplitudes, self.block_size)
-        pitch = upsample(pitch, self.block_size)
-
-        harmonic = harmonic_synth(pitch, amplitudes, self.sampling_rate)
-
-        # noise part
-        param = scale_function(self.proj_matrices[1](hidden) - 5)
-
-        impulse = amp_to_impulse_response(param, self.block_size)
-        noise = torch.rand(
-            impulse.shape[0],
-            impulse.shape[1],
-            self.block_size,
-        ).to(impulse) * 2 - 1
-
-        noise = fft_convolve(noise, impulse).contiguous()
-        noise = noise.reshape(noise.shape[0], -1, 1)
-
-        signal = harmonic + noise
-
-        #reverb part
-        signal = self.reverb(signal)
 
         return signal

@@ -135,7 +135,7 @@ def fade_in_out(signal, fade_length=1000):
     return signal
 
 
-def generate_wavetable(length, f):
+def generate_wavetable(length, f, cycle=1, phase=0):
     """
     Generate a wavetable of specified length using 
     function f(x) where x is phase.
@@ -143,7 +143,7 @@ def generate_wavetable(length, f):
     """
     wavetable = np.zeros((length,), dtype=np.float32)
     for i in range(length):
-        wavetable[i] = f(2 * np.pi * i / length)
+        wavetable[i] = f(cycle * 2 * np.pi * i / length + phase * np.pi)
     return wavetable
 
 
@@ -285,4 +285,7 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    wt = generate_wavetable(512, np.sin, cycle=4, phase=0.5)
+    import matplotlib.pyplot as plt
+    plt.plot(wt)
+    plt.show()

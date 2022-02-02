@@ -9,3 +9,5 @@ share/
 test.gv
 test.gv.pdf
 *.pt
+!test_audio/*.wav
+!img/*.png
